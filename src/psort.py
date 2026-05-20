@@ -14,9 +14,11 @@
 import os
 import subprocess
 import time
+from datetime import datetime, timezone
 
 from celery import signals
 from celery.utils.log import get_task_logger
+from dateutil.relativedelta import relativedelta
 from openrelik_common import telemetry
 from openrelik_common.logging import Logger
 from openrelik_worker_common.file_utils import create_output_file
@@ -47,8 +49,77 @@ TASK_METADATA = {
             "items": sorted(output_formats_available),
             "required": False,
         },
+        {
+            "name": "slices",
+            "label": "Number of time slices",
+            "description": (
+                "Split psort output into N files, each covering a trailing "
+                "time window ending at the previous slice's start. Leave at 1 "
+                "(default) to produce a single output file as before. "
+                "Allowed range: 1-12."
+            ),
+            "type": "text",
+            "value": "1",
+            "required": False,
+        },
+        {
+            "name": "months_per_slice",
+            "label": "Months per slice",
+            "description": (
+                "Width of each slice in months (used only when slices > 1). "
+                "Slice i covers [now - i*M months, now - (i-1)*M months). "
+                "Allowed range: 1-12."
+            ),
+            "type": "text",
+            "value": "3",
+            "required": False,
+        },
+        {
+            "name": "register_in_db",
+            "label": "Register output files in the database",
+            "description": (
+                "When enabled (default), each psort output file is registered "
+                "in the OpenRelik database and appears in the UI. Disable for "
+                "intermediate runs that only feed downstream tasks."
+            ),
+            "type": "switch",
+            "value": True,
+            "required": False,
+        },
     ],
 }
+
+
+def _compute_slice_ranges(
+    slices: int, months_per_slice: int, now: datetime
+) -> list[tuple[datetime | None, datetime | None]]:
+    """Return slice (start, end) pairs, oldest-first.
+
+    For ``slices == 1`` returns ``[(None, None)]`` as a sentinel meaning
+    "no filter — run psort once over the whole storage file".
+    """
+    if slices == 1:
+        return [(None, None)]
+    ranges: list[tuple[datetime, datetime]] = []
+    for i in range(slices, 0, -1):
+        end = now - relativedelta(months=(i - 1) * months_per_slice)
+        start = now - relativedelta(months=i * months_per_slice)
+        ranges.append((start, end))
+    return ranges
+
+
+def _parse_int_in_range(raw, name: str, lo: int, hi: int, default: int) -> int:
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"task_config[{name!r}] must be an integer; got {raw!r}") from exc
+    if value < lo or value > hi:
+        raise ValueError(
+            f"task_config[{name!r}] must be between {lo} and {hi}; got {value}"
+        )
+    return value
 
 log_root = Logger()
 logger = log_root.get_logger(__name__, get_task_logger(__name__))
@@ -100,59 +171,98 @@ def psort(
     if task_config and task_config.get("output_format"):
         output_extension = task_config["output_format"]
 
+    cfg = task_config or {}
+    register_in_db = cfg.get("register_in_db", True)
+    slices = _parse_int_in_range(cfg.get("slices"), "slices", 1, 12, default=1)
+    months_per_slice = _parse_int_in_range(
+        cfg.get("months_per_slice"), "months_per_slice", 1, 12, default=3
+    )
+    slice_ranges = _compute_slice_ranges(
+        slices, months_per_slice, datetime.now(timezone.utc)
+    )
+
+    psort_filter_fmt = "%Y-%m-%dT%H:%M:%S"
+
     for input_file in input_files:
-        output_file = create_output_file(
-            output_path,
-            display_name=f"{input_file.get('display_name')}.{output_extension}",
-            data_type=f"plaso:psort:{output_extension}",
-        )
-        status_file = create_output_file(output_path, extension="status")
+        for slice_idx, (start, end) in enumerate(slice_ranges, start=1):
+            if start is None and end is None:
+                slice_display_name = (
+                    f"{input_file.get('display_name')}.{output_extension}"
+                )
+            else:
+                slice_display_name = (
+                    f"{input_file.get('display_name')}."
+                    f"{start:%Y-%m-%d}_{end:%Y-%m-%d}.{output_extension}"
+                )
 
-        command = [
-            "psort.py",
-            "--quiet",
-            "--status-view",
-            "file",
-            "--additional_fields",
-            "yara_match",
-            "--status-view-file",
-            status_file.path,
-            "-w",
-            output_file.path,
-        ]
-        if task_config and task_config.get("output_format"):
-            command.extend(["-o", task_config["output_format"]])
-        command.append(input_file.get("path"))
+            output_file = create_output_file(
+                output_path,
+                display_name=slice_display_name,
+                data_type=f"plaso:psort:{output_extension}",
+                register_in_db=register_in_db,
+            )
+            status_file = create_output_file(output_path, extension="status")
 
-        command_string = " ".join(command)
+            command = [
+                "psort.py",
+                "--quiet",
+                "--status-view",
+                "file",
+                "--additional_fields",
+                "yara_match",
+                "--status-view-file",
+                status_file.path,
+                "-w",
+                output_file.path,
+            ]
+            if cfg.get("output_format"):
+                command.extend(["-o", cfg["output_format"]])
+            if start is not None and end is not None:
+                command.extend(
+                    [
+                        "--filter",
+                        (
+                            f"date > '{start.strftime(psort_filter_fmt)}' "
+                            f"AND date <= '{end.strftime(psort_filter_fmt)}'"
+                        ),
+                    ]
+                )
+            command.append(input_file.get("path"))
 
-        # Send initial status event to indicate task start
-        self.send_event("task-progress", data={})
+            command_string = " ".join(command)
 
-        logger.info(f"Starting {' '.join(command)}")
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        while process.poll() is None:
-            if not os.path.exists(status_file.path):
-                continue
-            with open(status_file.path, "r") as f:
-                status_dict = {}
-                try:
-                    status_dict = log2timeline_status_to_dict(f.read())
-                except:
-                    pass
-                self.send_event("task-progress", data=status_dict)
-            time.sleep(2)
-        logger.info(process.stdout.read())
-        if process.stderr:
-            process_plaso_cli_logs(process.stderr.read(), logger)
+            # Send initial status event to indicate slice start
+            self.send_event(
+                "task-progress",
+                data={"slice": f"{slice_idx}/{slices}"} if slices > 1 else {},
+            )
 
-    output_files.append(output_file.to_dict())
+            logger.info(f"Starting {' '.join(command)}")
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+            while process.poll() is None:
+                if not os.path.exists(status_file.path):
+                    continue
+                with open(status_file.path, "r") as f:
+                    status_dict = {}
+                    try:
+                        status_dict = log2timeline_status_to_dict(f.read())
+                    except:
+                        pass
+                    if slices > 1:
+                        status_dict["slice"] = f"{slice_idx}/{slices}"
+                    self.send_event("task-progress", data=status_dict)
+                time.sleep(2)
+            logger.info(process.stdout.read())
+            if process.stderr:
+                process_plaso_cli_logs(process.stderr.read(), logger)
+
+            output_files.append(output_file.to_dict())
 
     return create_task_result(
         output_files=output_files,
