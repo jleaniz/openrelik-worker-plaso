@@ -51,12 +51,13 @@ TASK_METADATA = {
         },
         {
             "name": "slices",
-            "label": "Number of time slices",
+            "label": "Number of time slices (1 = no slicing)",
             "description": (
-                "Split psort output into N files, each covering a trailing "
-                "time window ending at the previous slice's start. Leave at 1 "
-                "(default) to produce a single output file as before. "
-                "Allowed range: 1-12."
+                "Default 1 produces a single output file covering the entire "
+                "storage (no date filter). Set to N > 1 to "
+                "split the output into N files, each covering a trailing "
+                "window of 'Months per slice' months ending at the previous "
+                "slice's start. Allowed range: 1-12."
             ),
             "type": "text",
             "value": "1",
@@ -64,11 +65,12 @@ TASK_METADATA = {
         },
         {
             "name": "months_per_slice",
-            "label": "Months per slice",
+            "label": "Months per slice (ignored when slices = 1)",
             "description": (
-                "Width of each slice in months (used only when slices > 1). "
-                "Slice i covers [now - i*M months, now - (i-1)*M months). "
-                "Allowed range: 1-12."
+                "Width of each slice in months. Only takes effect when "
+                "slices > 1; with slices = 1 the entire storage is exported "
+                "and this value is unused. Slice i covers "
+                "[now - i*M months, now - (i-1)*M months). Allowed range: 1-12."
             ),
             "type": "text",
             "value": "3",
