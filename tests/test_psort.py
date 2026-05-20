@@ -299,6 +299,44 @@ def test_psort_multiple_inputs_emit_all_outputs(tmp_path, fake_subprocess, bound
     assert names == ["a.plaso.csv", "b.plaso.csv"]
 
 
+def test_psort_threads_original_path_from_input(tmp_path, fake_subprocess, bound_task):
+    """Each output file's original_path must reference the upstream upload so
+    downstream tasks (e.g. S3 export) can name objects after the user's file."""
+    inputs = [
+        {
+            "path": "/in/foo.plaso",
+            "display_name": "foo.plaso",
+            "original_path": "/uploads/evidence.E01",
+        }
+    ]
+
+    raw = psort.psort(
+        bound_task,
+        input_files=inputs,
+        output_path=str(tmp_path),
+        workflow_id="wf-original",
+        task_config=None,
+    )
+    result = _decode(raw)
+    assert result["output_files"][0]["original_path"] == "/uploads/evidence.E01"
+
+
+def test_psort_falls_back_to_path_when_original_path_missing(
+    tmp_path, fake_subprocess, bound_task
+):
+    inputs = [{"path": "/in/foo.plaso", "display_name": "foo.plaso"}]
+
+    raw = psort.psort(
+        bound_task,
+        input_files=inputs,
+        output_path=str(tmp_path),
+        workflow_id="wf-fallback",
+        task_config=None,
+    )
+    result = _decode(raw)
+    assert result["output_files"][0]["original_path"] == "/in/foo.plaso"
+
+
 def test_psort_slices_x_inputs_cartesian(tmp_path, fake_subprocess, bound_task):
     inputs = [
         {"path": "/in/a.plaso", "display_name": "a.plaso"},

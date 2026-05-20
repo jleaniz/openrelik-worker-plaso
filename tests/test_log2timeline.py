@@ -70,3 +70,21 @@ def test_register_in_db_threaded_through_to_create_output_file():
     assert register_passes >= storage_calls, (
         "every plaso_storage create_output_file call must thread register_in_db"
     )
+
+
+def test_single_input_threads_upstream_original_path():
+    """Single-input runs must forward the upstream upload's original_path
+    onto the .plaso OutputFile so downstream tasks like the S3 exporter can
+    derive object keys from the user's uploaded filename rather than this
+    worker's UUID-based on-disk name."""
+    source = LOG2TIMELINE_PATH.read_text()
+    # The single-input branch should pass original_path explicitly, derived
+    # from the upstream input's original_path with a fallback to its path.
+    assert 'original_path=upstream_original' in source, (
+        "single-input branch must thread the upstream original_path "
+        "into create_output_file"
+    )
+    assert (
+        'input_files[0].get("original_path")' in source
+        and 'input_files[0].get("path")' in source
+    ), "single-input branch must derive upstream_original with a path fallback"

@@ -199,6 +199,9 @@ def psort(
                 output_path,
                 display_name=slice_display_name,
                 data_type=f"plaso:psort:{output_extension}",
+                original_path=(
+                    input_file.get("original_path") or input_file.get("path")
+                ),
                 register_in_db=register_in_db,
             )
             status_file = create_output_file(output_path, extension="status")
