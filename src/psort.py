@@ -162,7 +162,7 @@ def psort(
 
     input_files = get_input_files(pipe_result, input_files or [])
     output_files = []
-    command_string = ""
+    command_strings = []
 
     telemetry.add_attribute_to_current_span("input_files", input_files)
     telemetry.add_attribute_to_current_span("task_config", task_config)
@@ -235,7 +235,7 @@ def psort(
                 )
             command.append(input_file.get("path"))
 
-            command_string = " ".join(command)
+            command_strings.append(" ".join(command))
 
             # Send initial status event to indicate slice start
             self.send_event(
@@ -268,10 +268,32 @@ def psort(
             if process.stderr:
                 process_plaso_cli_logs(process.stderr.read(), logger)
 
-            output_files.append(output_file.to_dict())
+            # A time slice that matches no events leaves no output file on
+            # disk (or an empty one), and a non-zero exit means psort failed.
+            # In either case the file must not be reported downstream, or the
+            # export workers will FileNotFoundError on a path that was never
+            # written.
+            returncode = process.poll()
+            try:
+                produced_output = os.path.getsize(output_file.path) > 0
+            except OSError:
+                produced_output = False
+
+            if returncode == 0 and produced_output:
+                output_files.append(output_file.to_dict())
+            else:
+                logger.info(
+                    "Skipping empty/failed psort slice %d/%d for %s "
+                    "(returncode=%s, output_present=%s)",
+                    slice_idx,
+                    total_slices,
+                    input_file.get("display_name"),
+                    returncode,
+                    produced_output,
+                )
 
     return create_task_result(
         output_files=output_files,
         workflow_id=workflow_id,
-        command=command_string,
+        command="\n".join(command_strings),
     )

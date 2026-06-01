@@ -11,9 +11,13 @@ import json
 import sys
 import types
 
-from src import psort  # noqa: E402
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
+
+# NOTE: the stub blocks below must run BEFORE `from src import psort`, because
+# importing psort pulls in plaso / openrelik_common / src.app at module load
+# time. Importing psort first would fail collection wherever those heavy deps
+# aren't installed (the whole point of stubbing them).
 
 if "plaso" not in sys.modules:
     plaso_pkg = types.ModuleType("plaso")
@@ -68,6 +72,9 @@ if "src.app" not in sys.modules:
 
     app_mod.celery = _FakeCelery()
     sys.modules["src.app"] = app_mod
+
+# Import the module under test only after the heavy deps are stubbed.
+from src import psort  # noqa: E402
 
 
 class TestComputeSliceRanges:
@@ -131,31 +138,51 @@ def _decode(result_b64: str) -> dict:
 def fake_subprocess(tmp_path, monkeypatch):
     """Patch subprocess.Popen + os.path.exists so the task body runs without
     actually invoking psort. Returns a list capturing every command invoked.
+
+    By default the fake process simulates a successful psort run that writes a
+    non-empty output file to its ``-w`` path, so the task's "only report files
+    that were actually produced" guard sees real output. Tests that need to
+    simulate an empty/failed slice can override behavior via ``invoked`` config.
     """
-    invoked: list[list[str]] = []
+    class _InvokedCommands(list):
+        """List of invoked commands, plus per-test knobs for the fake process.
+
+        Subclassing list keeps the existing ``len()`` / indexing / ``== []``
+        assertions working while letting a test tweak ``returncode`` /
+        ``write_output`` to simulate a failed or empty psort slice.
+        """
+
+        returncode = 0
+        write_output = True
+
+    invoked = _InvokedCommands()
 
     class _FakeProcess:
-        def __init__(self, *args, **kwargs):
-            self._polled = False
+        def __init__(self, returncode=0):
+            self._returncode = returncode
             self.stdout = MagicMock()
             self.stdout.read.return_value = ""
             self.stderr = MagicMock()
             self.stderr.read.return_value = ""
 
         def poll(self):
-            # Return None once (so the loop body can run if it wants), then 0.
-            if not self._polled:
-                self._polled = True
-                return 0
-            return 0
+            # Return the (already finished) returncode every call; the task's
+            # status-polling while-loop exits immediately because it's non-None.
+            return self._returncode
 
     def fake_popen(cmd, *args, **kwargs):
         invoked.append(list(cmd))
-        return _FakeProcess()
+        # Mirror a real psort run: write the output file named by ``-w`` so the
+        # task's getsize() guard observes produced output.
+        if invoked.write_output and "-w" in cmd:
+            output_path = cmd[cmd.index("-w") + 1]
+            with open(output_path, "w") as fh:
+                fh.write("timeline-row\n")
+        return _FakeProcess(returncode=invoked.returncode)
 
     monkeypatch.setattr(psort.subprocess, "Popen", fake_popen)
     # status_file never exists, so the inner status-polling loop body is
-    # skipped (process.poll() returns 0 immediately anyway).
+    # skipped (process.poll() returns non-None immediately anyway).
     monkeypatch.setattr(psort.os.path, "exists", lambda p: False)
     return invoked
 
@@ -317,6 +344,64 @@ def test_psort_falls_back_to_path_when_original_path_missing(
     )
     result = _decode(raw)
     assert result["output_files"][0]["original_path"] == "/in/foo.plaso"
+
+
+def test_psort_skips_slice_with_no_output_file(tmp_path, fake_subprocess, bound_task):
+    """A slice that matches no events leaves no file on disk; it must not be
+    reported, or downstream export workers FileNotFoundError on it."""
+    fake_subprocess.write_output = False  # simulate psort writing nothing
+    inputs = [{"path": "/in/foo.plaso", "display_name": "foo.plaso"}]
+
+    raw = psort.psort(
+        bound_task,
+        input_files=inputs,
+        output_path=str(tmp_path),
+        workflow_id="wf-empty",
+        task_config={"slices": "3", "months_per_slice": "3"},
+    )
+    # All three slices ran...
+    assert len(fake_subprocess) == 3
+    # ...but none produced a file, so none are reported.
+    result = _decode(raw)
+    assert result["output_files"] == []
+
+
+def test_psort_skips_failed_slice_nonzero_returncode(
+    tmp_path, fake_subprocess, bound_task
+):
+    """A non-zero psort exit must not report an output file even if one exists."""
+    fake_subprocess.returncode = 1
+    inputs = [{"path": "/in/foo.plaso", "display_name": "foo.plaso"}]
+
+    raw = psort.psort(
+        bound_task,
+        input_files=inputs,
+        output_path=str(tmp_path),
+        workflow_id="wf-failed",
+        task_config=None,
+    )
+    result = _decode(raw)
+    assert result["output_files"] == []
+
+
+def test_psort_command_string_includes_every_slice(
+    tmp_path, fake_subprocess, bound_task
+):
+    """The reported command must list every slice's invocation, not just the
+    last one (regression for command_string being overwritten each iteration)."""
+    inputs = [{"path": "/in/foo.plaso", "display_name": "foo.plaso"}]
+
+    raw = psort.psort(
+        bound_task,
+        input_files=inputs,
+        output_path=str(tmp_path),
+        workflow_id="wf-cmd",
+        task_config={"slices": "3", "months_per_slice": "3"},
+    )
+    result = _decode(raw)
+    command_lines = result["command"].splitlines()
+    assert len(command_lines) == 3
+    assert all("psort.py" in line for line in command_lines)
 
 
 def test_psort_slices_x_inputs_cartesian(tmp_path, fake_subprocess, bound_task):
