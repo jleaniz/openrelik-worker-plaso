@@ -185,6 +185,7 @@ def psort(
 
     psort_filter_fmt = "%Y-%m-%dT%H:%M:%S"
 
+    total_slices = len(slice_ranges)
     for input_file in input_files:
         for slice_idx, (start, end) in enumerate(slice_ranges, start=1):
             if start is None and end is None:
@@ -194,7 +195,7 @@ def psort(
             else:
                 slice_display_name = (
                     f"{input_file.get('display_name')}."
-                    f"{start:%Y-%m-%d}_{end:%Y-%m-%d}.{output_extension}"
+                    f"slice-{slice_idx}-of-{total_slices}.{output_extension}"
                 )
 
             output_file = create_output_file(

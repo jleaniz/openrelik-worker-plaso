@@ -5,13 +5,15 @@ local pytest environment. We stub the plaso modules psort.py imports at
 collection time so the tests run anywhere.
 """
 
+import base64
+import pytest
+import json
 import sys
 import types
+
+from src import psort  # noqa: E402
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
-
-
-# --- Stub plaso.output.manager before importing src.psort ------------------
 
 if "plaso" not in sys.modules:
     plaso_pkg = types.ModuleType("plaso")
@@ -68,17 +70,6 @@ if "src.app" not in sys.modules:
     sys.modules["src.app"] = app_mod
 
 
-import base64
-import json
-
-import pytest
-
-from src import psort  # noqa: E402
-
-
-# ---------- Pure helpers -----------------------------------------------------
-
-
 class TestComputeSliceRanges:
     def test_single_slice_returns_sentinel(self):
         ranges = psort._compute_slice_ranges(
@@ -130,9 +121,6 @@ class TestParseIntInRange:
     def test_non_integer(self):
         with pytest.raises(ValueError, match="must be an integer"):
             psort._parse_int_in_range("foo", "slices", 1, 12, default=1)
-
-
-# ---------- Task body --------------------------------------------------------
 
 
 def _decode(result_b64: str) -> dict:
@@ -221,16 +209,12 @@ def test_psort_three_slices_emits_three_filtered_runs(
         filter_arg = cmd[cmd.index("--filter") + 1]
         assert "date >" in filter_arg and "date <=" in filter_arg
     result = _decode(raw)
-    display_names = [f["display_name"] for f in result["output_files"]]
-    assert len(display_names) == 3
-    # All names follow the <input>.<start>_<end>.csv pattern.
-    for name in display_names:
-        assert name.startswith("foo.plaso.")
-        assert name.endswith(".csv")
-        # date_date segment = 21 chars (YYYY-MM-DD_YYYY-MM-DD).
-        middle = name[len("foo.plaso.") : -len(".csv")]
-        assert len(middle) == 21
-        assert middle[10] == "_"
+    display_names = sorted(f["display_name"] for f in result["output_files"])
+    assert display_names == [
+        "foo.plaso.slice-1-of-3.csv",
+        "foo.plaso.slice-2-of-3.csv",
+        "foo.plaso.slice-3-of-3.csv",
+    ]
 
 
 def test_psort_register_in_db_false_propagates(tmp_path, fake_subprocess, bound_task):
@@ -263,9 +247,7 @@ def test_psort_invalid_slices_raises_before_subprocess(
     assert fake_subprocess == []
 
 
-def test_psort_invalid_slices_non_integer_raises(
-    tmp_path, fake_subprocess, bound_task
-):
+def test_psort_invalid_slices_non_integer_raises(tmp_path, fake_subprocess, bound_task):
     inputs = [{"path": "/in/foo.plaso", "display_name": "foo.plaso"}]
 
     with pytest.raises(ValueError, match="must be an integer"):
